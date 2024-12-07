@@ -60,6 +60,7 @@ impl<I: Iterator<Item = u32>> super::Frontend<I> {
                 ),
                 named_expressions: crate::NamedExpressions::default(),
                 body: crate::Block::new(),
+                diagnostic_filter_leaf: None,
             }
         };
 
@@ -311,6 +312,7 @@ impl<I: Iterator<Item = u32>> super::Frontend<I> {
             expressions: Arena::new(),
             named_expressions: crate::NamedExpressions::default(),
             body: crate::Block::new(),
+            diagnostic_filter_leaf: None,
         };
 
         // 1. copy the inputs from arguments to privates
@@ -567,6 +569,7 @@ impl<I: Iterator<Item = u32>> super::Frontend<I> {
             stage: ep.stage,
             early_depth_test: ep.early_depth_test,
             workgroup_size: ep.workgroup_size,
+            workgroup_size_overrides: None,
             function,
         });
 
@@ -574,7 +577,7 @@ impl<I: Iterator<Item = u32>> super::Frontend<I> {
     }
 }
 
-impl<'function> BlockContext<'function> {
+impl BlockContext<'_> {
     pub(super) fn gctx(&self) -> crate::proc::GlobalCtx {
         crate::proc::GlobalCtx {
             types: self.type_arena,

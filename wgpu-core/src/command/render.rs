@@ -14,8 +14,8 @@ use crate::{
         end_occlusion_query, end_pipeline_statistics_query,
         memory_init::{fixup_discarded_surfaces, SurfacesInDiscardState},
         ArcPassTimestampWrites, BasePass, BindGroupStateChange, CommandBuffer, CommandEncoderError,
-        CommandEncoderStatus, DrawError, ExecutionError, MapPassErr, PassErrorScope,
-        PassTimestampWrites, QueryUseError, RenderCommandError, StateChange,
+        DrawError, ExecutionError, MapPassErr, PassErrorScope, PassTimestampWrites, QueryUseError,
+        RenderCommandError, StateChange,
     },
     device::{
         AttachmentData, Device, DeviceError, MissingDownlevelFlags, MissingFeatures,
@@ -45,8 +45,7 @@ use serde::Deserialize;
 #[cfg(feature = "serde")]
 use serde::Serialize;
 
-use std::sync::Arc;
-use std::{borrow::Cow, fmt, iter, mem::size_of, num::NonZeroU32, ops::Range, str};
+use std::{borrow::Cow, fmt, iter, mem::size_of, num::NonZeroU32, ops::Range, str, sync::Arc};
 
 use super::render_command::ArcRenderCommand;
 use super::{
@@ -624,10 +623,6 @@ pub enum RenderPassErrorInner {
         src: wgt::TextureFormat,
         dst: wgt::TextureFormat,
     },
-    #[error("Surface texture is dropped before the render pass is finished")]
-    SurfaceTextureDropped,
-    #[error("Not enough memory left for render pass")]
-    OutOfMemory,
     #[error("Unable to clear non-present/read-only depth")]
     InvalidDepthOps,
     #[error("Unable to clear non-present/read-only stencil")]
@@ -638,6 +633,8 @@ pub enum RenderPassErrorInner {
     MissingFeatures(#[from] MissingFeatures),
     #[error(transparent)]
     MissingDownlevelFlags(#[from] MissingDownlevelFlags),
+    #[error("Indirect buffer offset {0:?} is not a multiple of 4")]
+    UnalignedIndirectBufferOffset(BufferAddress),
     #[error("Indirect draw uses bytes {offset}..{end_offset} {} which overruns indirect buffer of size {buffer_size}",
         count.map_or_else(String::new, |v| format!("(using count {v})")))]
     IndirectBufferOverrun {
@@ -1323,7 +1320,9 @@ impl Global {
     /// If creation fails, an invalid pass is returned.
     /// Any operation on an invalid pass will return an error.
     ///
-    /// If successful, puts the encoder into the [`CommandEncoderStatus::Locked`] state.
+    /// If successful, puts the encoder into the [`Locked`] state.
+    ///
+    /// [`Locked`]: crate::command::CommandEncoderStatus::Locked
     pub fn command_encoder_create_render_pass(
         &self,
         encoder_id: id::CommandEncoderId,
@@ -1356,9 +1355,11 @@ impl Global {
                 }) = color_attachment
                 {
                     let view = texture_views.get(*view_id).get()?;
+                    view.same_device(device)?;
 
                     let resolve_target = if let Some(resolve_target_id) = resolve_target {
                         let rt_arc = texture_views.get(*resolve_target_id).get()?;
+                        rt_arc.same_device(device)?;
 
                         Some(rt_arc)
                     } else {
@@ -1380,6 +1381,7 @@ impl Global {
             arc_desc.depth_stencil_attachment =
                 if let Some(depth_stencil_attachment) = desc.depth_stencil_attachment {
                     let view = texture_views.get(depth_stencil_attachment.view).get()?;
+                    view.same_device(device)?;
 
                     Some(ArcRenderPassDepthStencilAttachment {
                         view,
@@ -1390,21 +1392,15 @@ impl Global {
                     None
                 };
 
-            arc_desc.timestamp_writes = if let Some(tw) = desc.timestamp_writes {
-                let query_set = query_sets.get(tw.query_set).get()?;
-
-                Some(ArcPassTimestampWrites {
-                    query_set,
-                    beginning_of_pass_write_index: tw.beginning_of_pass_write_index,
-                    end_of_pass_write_index: tw.end_of_pass_write_index,
-                })
-            } else {
-                None
-            };
+            arc_desc.timestamp_writes = desc
+                .timestamp_writes
+                .map(|tw| Global::validate_pass_timestamp_writes(device, &query_sets, tw))
+                .transpose()?;
 
             arc_desc.occlusion_query_set =
                 if let Some(occlusion_query_set) = desc.occlusion_query_set {
                     let query_set = query_sets.get(occlusion_query_set).get()?;
+                    query_set.same_device(device)?;
 
                     Some(query_set)
                 } else {
@@ -1427,11 +1423,7 @@ impl Global {
 
         let cmd_buf = hub.command_buffers.get(encoder_id.into_command_buffer_id());
 
-        match cmd_buf
-            .try_get()
-            .map_err(|e| e.into())
-            .and_then(|mut cmd_buf_data| cmd_buf_data.lock_encoder())
-        {
+        match cmd_buf.data.lock().lock_encoder() {
             Ok(_) => {}
             Err(e) => return make_err(e, arc_desc),
         };
@@ -1462,7 +1454,8 @@ impl Global {
                 .hub
                 .command_buffers
                 .get(encoder_id.into_command_buffer_id());
-            let mut cmd_buf_data = cmd_buf.try_get().map_pass_err(pass_scope)?;
+            let mut cmd_buf_data = cmd_buf.data.lock();
+            let cmd_buf_data = cmd_buf_data.get_inner().map_pass_err(pass_scope)?;
 
             if let Some(ref mut list) = cmd_buf_data.commands {
                 list.push(crate::device::trace::Command::RunRenderPass {
@@ -1537,9 +1530,9 @@ impl Global {
             base.label.as_deref().unwrap_or("")
         );
 
-        let mut cmd_buf_data = cmd_buf.try_get().map_pass_err(pass_scope)?;
-        cmd_buf_data.unlock_encoder().map_pass_err(pass_scope)?;
-        let cmd_buf_data = &mut *cmd_buf_data;
+        let mut cmd_buf_data = cmd_buf.data.lock();
+        let mut cmd_buf_data_guard = cmd_buf_data.unlock_encoder().map_pass_err(pass_scope)?;
+        let cmd_buf_data = &mut *cmd_buf_data_guard;
 
         let device = &cmd_buf.device;
         let snatch_guard = &device.snatchable_lock.read();
@@ -1550,7 +1543,6 @@ impl Global {
             device.check_is_valid().map_pass_err(pass_scope)?;
 
             let encoder = &mut cmd_buf_data.encoder;
-            let status = &mut cmd_buf_data.status;
             let tracker = &mut cmd_buf_data.trackers;
             let buffer_memory_init_actions = &mut cmd_buf_data.buffer_memory_init_actions;
             let texture_memory_actions = &mut cmd_buf_data.texture_memory_actions;
@@ -1560,8 +1552,6 @@ impl Global {
             // we want to insert a command buffer _before_ what we're about to record,
             // we need to make sure to close the previous one.
             encoder.close(&cmd_buf.device).map_pass_err(pass_scope)?;
-            // We will reset this to `Recording` if we succeed, acts as a fail-safe.
-            *status = CommandEncoderStatus::Error;
             encoder
                 .open_pass(hal_label, &cmd_buf.device)
                 .map_pass_err(pass_scope)?;
@@ -1872,7 +1862,6 @@ impl Global {
         };
 
         let encoder = &mut cmd_buf_data.encoder;
-        let status = &mut cmd_buf_data.status;
         let tracker = &mut cmd_buf_data.trackers;
 
         {
@@ -1891,10 +1880,10 @@ impl Global {
             CommandBuffer::insert_barriers_from_scope(transit, tracker, &scope, snatch_guard);
         }
 
-        *status = CommandEncoderStatus::Recording;
         encoder
             .close_and_swap(&cmd_buf.device)
             .map_pass_err(pass_scope)?;
+        cmd_buf_data_guard.mark_successful();
 
         Ok(())
     }
@@ -2450,6 +2439,10 @@ fn multi_draw_indirect(
 
     let actual_count = count.map_or(1, |c| c.get());
 
+    if offset % 4 != 0 {
+        return Err(RenderPassErrorInner::UnalignedIndirectBufferOffset(offset));
+    }
+
     let end_offset = offset + stride as u64 * actual_count as u64;
     if end_offset > indirect_buffer.size {
         return Err(RenderPassErrorInner::IndirectBufferOverrun {
@@ -2533,6 +2526,10 @@ fn multi_draw_indirect_count(
 
     count_buffer.check_usage(BufferUsages::INDIRECT)?;
     let count_raw = count_buffer.try_raw(state.snatch_guard)?;
+
+    if offset % 4 != 0 {
+        return Err(RenderPassErrorInner::UnalignedIndirectBufferOffset(offset));
+    }
 
     let end_offset = offset + stride * max_count as u64;
     if end_offset > indirect_buffer.size {

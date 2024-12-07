@@ -50,6 +50,7 @@ struct Expectation {
     data: ExpectedData,
 }
 
+#[derive(serde::Deserialize)]
 struct Test<'a> {
     features: wgt::Features,
     expectations: Vec<Expectation>,
@@ -58,7 +59,7 @@ struct Test<'a> {
 
 fn map_callback(status: Result<(), wgc::resource::BufferAccessError>) {
     if let Err(e) = status {
-        panic!("Buffer map error: {}", e);
+        panic!("Buffer map error: {e}");
     }
 }
 
@@ -71,31 +72,11 @@ impl Test<'_> {
             wgt::Backend::Gl => "Gl",
             _ => unreachable!(),
         };
-        let string = read_to_string(path).unwrap().replace("Empty", backend_name);
-
-        #[derive(serde::Deserialize)]
-        struct SerializedTest<'a> {
-            features: Vec<String>,
-            expectations: Vec<Expectation>,
-            actions: Vec<wgc::device::trace::Action<'a>>,
-        }
-        let SerializedTest {
-            features,
-            expectations,
-            actions,
-        } = ron::de::from_str(&string).unwrap();
-        let features = features
-            .iter()
-            .map(|feature| {
-                wgt::Features::from_name(feature)
-                    .unwrap_or_else(|| panic!("Invalid feature flag {}", feature))
-            })
-            .fold(wgt::Features::empty(), |a, b| a | b);
-        Test {
-            features,
-            expectations,
-            actions,
-        }
+        let string = read_to_string(&path)
+            .unwrap()
+            .replace("Empty", backend_name);
+        ron::de::from_str(&string)
+            .unwrap_or_else(|e| panic!("{path:?}:{} {}", e.position.line, e.code))
     }
 
     fn run(
@@ -105,9 +86,8 @@ impl Test<'_> {
         adapter: wgc::id::AdapterId,
         test_num: u32,
     ) {
-        let backend = adapter.backend();
-        let device_id = wgc::id::Id::zip(test_num, 0, backend);
-        let queue_id = wgc::id::Id::zip(test_num, 0, backend);
+        let device_id = wgc::id::Id::zip(test_num, 1);
+        let queue_id = wgc::id::Id::zip(test_num, 1);
         let res = global.adapter_request_device(
             adapter,
             &wgt::DeviceDescriptor {
@@ -121,7 +101,7 @@ impl Test<'_> {
             Some(queue_id),
         );
         if let Err(e) = res {
-            panic!("{:?}", e);
+            panic!("{e:?}");
         }
 
         let mut command_buffer_id_manager = wgc::identity::IdentityManager::new();
@@ -137,7 +117,7 @@ impl Test<'_> {
         }
         println!("\t\t\tMapping...");
         for expect in &self.expectations {
-            let buffer = wgc::id::Id::zip(expect.buffer.index, expect.buffer.epoch, backend);
+            let buffer = wgc::id::Id::zip(expect.buffer.index, expect.buffer.epoch);
             global
                 .buffer_map_async(
                     buffer,
@@ -145,9 +125,7 @@ impl Test<'_> {
                     Some(expect.data.len() as u64),
                     wgc::resource::BufferMapOperation {
                         host: wgc::device::HostMap::Read,
-                        callback: Some(wgc::resource::BufferMapCallback::from_rust(Box::new(
-                            map_callback,
-                        ))),
+                        callback: Some(Box::new(map_callback)),
                     },
                 )
                 .unwrap();
@@ -160,7 +138,7 @@ impl Test<'_> {
 
         for expect in self.expectations {
             println!("\t\t\tChecking {}", expect.name);
-            let buffer = wgc::id::Id::zip(expect.buffer.index, expect.buffer.epoch, backend);
+            let buffer = wgc::id::Id::zip(expect.buffer.index, expect.buffer.epoch);
             let (ptr, size) = global
                 .buffer_get_mapped_range(
                     buffer,
@@ -187,8 +165,7 @@ impl Test<'_> {
 
             if &expected_data[..] != contents {
                 panic!(
-                    "Test expectation is not met!\nBuffer content was:\n{:?}\nbut expected:\n{:?}",
-                    contents, expected_data
+                    "Test expectation is not met!\nBuffer content was:\n{contents:?}\nbut expected:\n{expected_data:?}"
                 );
             }
         }
@@ -210,7 +187,7 @@ const BACKENDS: &[wgt::Backend] = &[
 
 impl Corpus {
     fn run_from(path: PathBuf) {
-        println!("Corpus {:?}", path);
+        println!("Corpus {path:?}");
         let dir = path.parent().unwrap();
         let corpus: Corpus = ron::de::from_reader(File::open(&path).unwrap()).unwrap();
 
@@ -220,7 +197,7 @@ impl Corpus {
             }
             let mut test_num = 0;
             for test_path in &corpus.tests {
-                println!("\t\tTest '{:?}'", test_path);
+                println!("\t\tTest '{test_path:?}'");
 
                 let global = wgc::global::Global::new(
                     "test",
@@ -237,17 +214,18 @@ impl Corpus {
                         force_fallback_adapter: false,
                         compatible_surface: None,
                     },
-                    wgc::instance::AdapterInputs::IdSet(&[wgc::id::Id::zip(0, 0, backend)]),
+                    wgt::Backends::from(backend),
+                    Some(wgc::id::Id::zip(0, 1)),
                 ) {
                     Ok(adapter) => adapter,
                     Err(_) => continue,
                 };
 
-                println!("\tBackend {:?}", backend);
+                println!("\tBackend {backend:?}");
                 let supported_features = global.adapter_features(adapter);
                 let downlevel_caps = global.adapter_downlevel_capabilities(adapter);
 
-                let test = Test::load(dir.join(test_path), adapter.backend());
+                let test = Test::load(dir.join(test_path), backend);
                 if !supported_features.contains(test.features) {
                     println!(
                         "\t\tSkipped due to missing features {:?}",
