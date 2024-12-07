@@ -58,7 +58,7 @@ pub enum SurfaceError {
     Lost,
     /// There is no more memory left to allocate a new frame.
     OutOfMemory,
-    /// Acquiring a texture failed for an unknown reason
+    /// Acquiring a texture failed with a generic error. Check error callbacks for more information.
     Other,
 }
 static_assertions::assert_impl_all!(SurfaceError: Send, Sync);
@@ -70,7 +70,7 @@ impl fmt::Display for SurfaceError {
             Self::Outdated => "The underlying surface has changed, and therefore the swap chain must be updated",
             Self::Lost =>  "The swap chain has been lost and needs to be recreated",
             Self::OutOfMemory => "There is no more memory left to allocate a new frame",
-            Self::Other => "Acquiring a texture failed for an unknown reason"
+            Self::Other => "Acquiring a texture failed with a generic error. Check error callbacks for more information",
         })
     }
 }

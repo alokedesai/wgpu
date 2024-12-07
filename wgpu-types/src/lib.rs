@@ -5642,7 +5642,7 @@ pub enum SurfaceStatus {
     Outdated,
     /// The surface under the swap chain is lost.
     Lost,
-    /// The surface status is not known.
+    /// The surface status is not known since `get_current_texture` previously failed.
     Unknown,
 }
 
